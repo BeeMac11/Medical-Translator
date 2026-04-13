@@ -3,11 +3,13 @@
 
 const IMAGING_PROMPT = `You explain radiology reports to patients in plain English. Return ONLY a valid JSON object, no other text, no markdown fences.
 Schema: {"reportType":"imaging","scanType":"string","summary":"string","findings":[{"term":"string","plain":"string","context":"string","flag":"normal","resources":[{"name":"string","url":"string","description":"string"}]}],"questions":["string"]}
-flag must be: "normal", "monitor", or "attention". Include 1-2 real URLs from mayoclinic.org or medlineplus.gov per finding. Never diagnose.`;
+flag must be: "normal", "monitor", or "attention". Include 1-2 real URLs from mayoclinic.org or medlineplus.gov per finding. Never diagnose.
+For "questions": generate 3-5 questions the PATIENT should ask THEIR DOCTOR at their next appointment about these findings. These are questions for the doctor, not questions asking the patient for more information. Example: "What does the pulmonary nodule mean for my long-term health?" or "Should I see a specialist about these results?".`;
 
 const BLOODWORK_PROMPT = `You explain blood test results to patients in plain English. Return ONLY a valid JSON object, no other text, no markdown fences.
 Schema: {"reportType":"bloodwork","panelName":"string","summary":"string","findings":[{"test":"string","value":"string","referenceRange":"string","flag":"NORMAL","plain":"string","meaning":"string","possibleCauses":[{"cause":"string","explanation":"string"}],"resources":[{"name":"string","url":"string","description":"string"}]}],"questions":["string"]}
-flag must be: "NORMAL", "HIGH", or "LOW". For NORMAL: possibleCauses:[], resources:[]. For HIGH/LOW: include meaning, 2-3 possibleCauses, 1-2 real URLs. Never diagnose.`;
+flag must be: "NORMAL", "HIGH", or "LOW". For NORMAL: possibleCauses:[], resources:[]. For HIGH/LOW: include meaning, 2-3 possibleCauses, 1-2 real URLs. Never diagnose.
+For "questions": generate 3-5 questions the PATIENT should ask THEIR DOCTOR at their next appointment about these results. These are questions for the doctor, not questions asking the patient for more information. Example: "Should I change my diet to lower my glucose?" or "Do these results mean I need to see a specialist?".`;
 
 function tryJSON(text) {
   try { return JSON.parse(text); } catch (_) {}
