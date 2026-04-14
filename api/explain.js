@@ -1,16 +1,20 @@
-
 // Vercel Serverless Function — sits between your browser and Anthropic API
-// This is what fixes the CORS error. Your API key stays safe on the server.
+// Single API call with auto-retry for overloaded errors
 
-const IMAGING_PROMPT = `You explain radiology reports to patients in plain English. Return ONLY a valid JSON object, no other text, no markdown fences.
-Schema: {"reportType":"imaging","scanType":"string","summary":"string","findings":[{"term":"string","plain":"string","context":"string","flag":"normal","resources":[{"name":"string","url":"string","description":"string"}]}],"questions":["string"]}
-flag must be: "normal", "monitor", or "attention". Include 1-2 real URLs from mayoclinic.org or medlineplus.gov per finding. Never diagnose.
-For "questions": generate 3-5 questions the PATIENT should ask THEIR DOCTOR at their next appointment about these findings. These are questions for the doctor, not questions asking the patient for more information. Example: "What does the pulmonary nodule mean for my long-term health?" or "Should I see a specialist about these results?".`;
+const COMBINED_PROMPT = `You explain medical reports to patients in plain English. 
+First detect if this is an imaging report (CT, MRI, X-ray, PET, ultrasound) or blood work / lab results, then explain it.
 
-const BLOODWORK_PROMPT = `You explain blood test results to patients in plain English. Return ONLY a valid JSON object, no other text, no markdown fences.
-Schema: {"reportType":"bloodwork","panelName":"string","summary":"string","findings":[{"test":"string","value":"string","referenceRange":"string","flag":"NORMAL","plain":"string","meaning":"string","possibleCauses":[{"cause":"string","explanation":"string"}],"resources":[{"name":"string","url":"string","description":"string"}]}],"questions":["string"]}
-flag must be: "NORMAL", "HIGH", or "LOW". For NORMAL: possibleCauses:[], resources:[]. For HIGH/LOW: include meaning, 2-3 possibleCauses, 1-2 real URLs. Never diagnose.
-For "questions": generate 3-5 questions the PATIENT should ask THEIR DOCTOR at their next appointment about these results. These are questions for the doctor, not questions asking the patient for more information. Example: "Should I change my diet to lower my glucose?" or "Do these results mean I need to see a specialist?".`;
+For IMAGING reports return this exact JSON:
+{"reportType":"imaging","scanType":"string","summary":"string","findings":[{"term":"string","plain":"string","context":"string","flag":"normal","resources":[{"name":"string","url":"string","description":"string"}]}],"questions":["string"]}
+flag must be: "normal", "monitor", or "attention". Include 1-2 real URLs from mayoclinic.org or medlineplus.gov per finding.
+
+For BLOOD WORK reports return this exact JSON:
+{"reportType":"bloodwork","panelName":"string","summary":"string","findings":[{"test":"string","value":"string","referenceRange":"string","flag":"NORMAL","plain":"string","meaning":"string","possibleCauses":[{"cause":"string","explanation":"string"}],"resources":[{"name":"string","url":"string","description":"string"}]}],"questions":["string"]}
+flag must be: "NORMAL", "HIGH", or "LOW". For NORMAL: possibleCauses:[], resources:[]. For HIGH/LOW: include meaning, 2-3 possibleCauses, 1-2 real URLs from mayoclinic.org or medlineplus.gov.
+
+For "questions": generate 3-5 questions the PATIENT should ask THEIR DOCTOR at their next appointment. Example: "Should I see a specialist about these results?"
+
+Return ONLY valid JSON. No markdown, no extra text. Never diagnose.`;
 
 function tryJSON(text) {
   try { return JSON.parse(text); } catch (_) {}
@@ -24,7 +28,11 @@ function tryJSON(text) {
   return null;
 }
 
-async function claudeCall(system, userText) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function claudeCall(userText) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -35,50 +43,43 @@ async function claudeCall(system, userText) {
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 4000,
-      system,
-      messages: [{ role: 'user', content: userText }],
+      system: COMBINED_PROMPT,
+      messages: [{ role: 'user', content: 'Explain this medical report:\n\n' + userText }],
     }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error('Anthropic API error: ' + JSON.stringify(data));
+  if (!res.ok) {
+    const errorType = data?.error?.type || '';
+    if (errorType === 'overloaded_error') throw new Error('OVERLOADED');
+    if (errorType === 'authentication_error') throw new Error('AUTH_ERROR');
+    if (errorType === 'rate_limit_error') throw new Error('RATE_LIMIT');
+    throw new Error('SERVER_ERROR');
+  }
   return data.content[0].text;
 }
 
-export default async function handler(req, res) {
-  // Allow requests from your frontend
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
-  const { reportText } = req.body;
-  if (!reportText || reportText.trim().length < 10) {
-    return res.status(400).json({ error: 'No report text provided' });
-  }
-
-  try {
-    // Step 1: Detect report type
-    const typeRaw = await claudeCall(
-      'Reply with one word only: imaging or bloodwork',
-      reportText.slice(0, 500)
-    );
-    const isBW = typeRaw.toLowerCase().includes('blood');
-
-    // Step 2: Explain findings
-    const raw = await claudeCall(
-      isBW ? BLOODWORK_PROMPT : IMAGING_PROMPT,
-      'Explain this medical report:\n\n' + reportText
-    );
-
-    const parsed = tryJSON(raw);
-    if (!parsed || !parsed.summary || !Array.isArray(parsed.findings)) {
-      return res.status(500).json({ error: 'Could not parse AI response. Please try again.' });
+async function claudeCallWithRetry(userText, maxRetries = 2) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await claudeCall(userText);
+    } catch (err) {
+      if (err.message === 'OVERLOADED' && attempt < maxRetries) {
+        // Wait 5 seconds then retry automatically
+        await sleep(5000);
+        continue;
+      }
+      throw err;
     }
-
-    return res.status(200).json(parsed);
-  } catch (err) {
-    return res.status(500).json({ error: err.message || 'Server error' });
   }
 }
+
+function getFriendlyError(code) {
+  switch(code) {
+    case 'OVERLOADED':
+      return 'The service is temporarily busy. Please wait 30 seconds and try again.';
+    case 'AUTH_ERROR':
+      return 'There is a configuration issue with the app. Please contact support.';
+    case 'RATE_LIMIT':
+      return 'Too many requests right now. Please wait a minute and try again.';
+    default:
+    
